@@ -10,6 +10,7 @@
 //! might not be what you expect.
 
 mod context;
+mod map;
 mod switch;
 #[allow(clippy::module_inception)]
 mod task;
@@ -54,6 +55,7 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            syscall_cnt: map::Map::new(),
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -135,6 +137,28 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    fn inc_syscall_cnt(&self, id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_cnt.inc(id);
+    }
+
+    fn get_syscall_cnt(&self, id: usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_cnt.get(id)
+    }
+}
+
+/// Get the syscall count.
+pub fn get_syscall_cnt(id: usize) -> usize {
+    TASK_MANAGER.get_syscall_cnt(id)
+}
+
+/// Increment the syscall count when syscall.
+pub fn inc_syscall_cnt(id: usize) {
+    TASK_MANAGER.inc_syscall_cnt(id);
 }
 
 /// Run the first task in task list.
