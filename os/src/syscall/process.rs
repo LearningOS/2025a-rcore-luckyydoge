@@ -1,8 +1,15 @@
 //! Process management syscalls
 
+use core::{mem::size_of, ptr::copy_nonoverlapping};
+
+use alloc::vec::Vec;
+
 use crate::{
-    mm::{VirtPageNum, KERNEL_SPACE},
-    task::{self, change_program_brk, exit_current_and_run_next, suspend_current_and_run_next},
+    mm::{translated_byte_buffer, VirtAddr, VirtPageNum, KERNEL_SPACE},
+    task::{
+        self, change_program_brk, current_user_token, exit_current_and_run_next,
+        suspend_current_and_run_next,
+    },
     timer::get_time_us,
 };
 
@@ -32,29 +39,39 @@ pub fn sys_yield() -> isize {
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     trace!("kernel: sys_get_time");
-    let kernel_space = KERNEL_SPACE.exclusive_access();
-    let ptr = _ts as usize;
-    if let Some(pa) = kernel_space.translate(crate::mm::VirtPageNum(ptr)) {
-        let us = get_time_us();
-        let pa = pa.ppn().get_mut::<TimeVal>();
-        *pa = TimeVal {
-            sec: us / 1_000_000,
-            usec: us % 1_000_000,
-        };
-        return 0;
+    let us = get_time_us();
+    let data = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let src = &data as *const TimeVal as *const u8;
+    let struct_size = size_of::<TimeVal>();
+    let buffer: Vec<&mut [u8]> =
+        translated_byte_buffer(current_user_token(), _ts as *const u8, struct_size);
+    let mut offset = 0;
+    for dst in buffer {
+        let len = dst.len().min(struct_size - offset);
+        let dst_ptr: *mut u8 = dst.as_mut_ptr();
+        let src_ptr: *const u8 = unsafe { src.add(offset) };
+        unsafe {
+            copy_nonoverlapping(src_ptr, dst_ptr, len);
+        }
+        offset += len;
     }
-    -1
+    0
 }
 
 /// TODO: Finish sys_trace to pass testcases
 /// HINT: You might reimplement it with virtual memory management.
 pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
     trace!("kernel: sys_trace");
+
+    let va = VirtAddr::from(_id);
     let ptr: *mut u8 = {
         let kernel_space = KERNEL_SPACE.exclusive_access();
-
-        if let Some(pte) = kernel_space.translate(VirtPageNum(_id)) {
-            pte.ppn().get_mut::<u8>()
+        if let Some(pte) = kernel_space.translate(VirtPageNum::from(va.floor())) {
+            let ppn = pte.ppn();
+            (ppn.0 + va.page_offset()) as *mut u8
         } else {
             return -1;
         }
