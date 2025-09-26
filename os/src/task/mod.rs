@@ -15,10 +15,12 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{self, MapPermission};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
+use mm::VirtAddr;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
@@ -165,6 +167,29 @@ impl TaskManager {
         let current_task = inner.current_task;
         inner.tasks[current_task].get_syscall_cnt(id)
     }
+
+    fn insert_frame_to_current_task(
+        &self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let mm_set = &mut inner.tasks[cur].memory_set;
+        mm_set.insert_framed_area(start_va, end_va, permission);
+    }
+
+    fn delete_frame_area_from_current_task(
+        &self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+    ) -> Option<()> {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let mm_set = &mut inner.tasks[cur].memory_set;
+        mm_set.delete_frame_area(start_va, end_va)
+    }
 }
 
 /// get the syscall count
@@ -223,4 +248,18 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Insert frames to current task.
+pub fn insert_frames_to_current_task(
+    start_va: VirtAddr,
+    end_va: VirtAddr,
+    permission: MapPermission,
+) {
+    TASK_MANAGER.insert_frame_to_current_task(start_va, end_va, permission);
+}
+
+/// Delete area from current tast.
+pub fn delete_area_from_current_task(start_va: VirtAddr, end_va: VirtAddr) -> Option<()> {
+    TASK_MANAGER.delete_frame_area_from_current_task(start_va, end_va)
 }

@@ -5,10 +5,14 @@ use core::{mem::size_of, ptr::copy_nonoverlapping};
 use alloc::vec::Vec;
 
 use crate::{
-    mm::{translated_byte_buffer, VirtAddr, VirtPageNum, KERNEL_SPACE},
+    config::PAGE_SIZE,
+    mm::{
+        translated_byte_buffer, MapPermission, PageTable, PageTableEntry, PhysAddr, VirtAddr,
+        VirtPageNum,
+    },
     task::{
-        self, change_program_brk, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+        self, change_program_brk, current_user_token, delete_area_from_current_task,
+        exit_current_and_run_next, insert_frames_to_current_task, suspend_current_and_run_next,
     },
     timer::get_time_us,
 };
@@ -66,21 +70,43 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
 pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
     trace!("kernel: sys_trace");
 
+    match (_id >> 38) & 1 {
+        0 => {
+            if _id >> 39 != 0 {
+                return -1;
+            }
+        }
+        1 => {
+            if (_id >> 39).count_zeros() != 0 {
+                return -1;
+            }
+        }
+        _ => {}
+    }
+
     let va = VirtAddr::from(_id);
+    let pte: PageTableEntry;
     let ptr: *mut u8 = {
-        let kernel_space = KERNEL_SPACE.exclusive_access();
-        if let Some(pte) = kernel_space.translate(VirtPageNum::from(va.floor())) {
-            let ppn = pte.ppn();
-            (ppn.0 + va.page_offset()) as *mut u8
+        let pagetable = PageTable::from_token(current_user_token());
+        if let Some(tmp) = pagetable.translate(VirtPageNum::from(va.floor())) {
+            let ppn = tmp.ppn();
+            pte = tmp;
+            (PhysAddr::from(ppn).0 + va.page_offset()) as *mut u8
         } else {
             return -1;
         }
     };
     match _trace_request {
         0 => unsafe {
+            if !pte.readable() {
+                return -1;
+            }
             return *ptr as isize;
         },
         1 => {
+            if !pte.writable() {
+                return -1;
+            }
             unsafe {
                 *ptr = _data as u8;
             }
@@ -92,15 +118,57 @@ pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
 }
 
 // YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
-    -1
+    if port & 0x7 == 0 || port & !0x7 != 0 || start & (PAGE_SIZE - 1) != 0 {
+        return -1;
+    }
+
+    let end = start + len;
+    let mut cur = start;
+
+    let pagetable = PageTable::from_token(current_user_token());
+    while cur < end {
+        let va = VirtAddr::from(cur);
+
+        if let Some(pte) = pagetable.translate(VirtPageNum::from(va.floor())) {
+            if pte.is_valid() {
+                return -1;
+            }
+        }
+        cur = VirtAddr::from(va.floor()).0 + PAGE_SIZE;
+    }
+    let (start_va, end_va) = (VirtAddr::from(start), VirtAddr::from(end));
+    let permission = {
+        let mut result = MapPermission::U;
+        if port & 0b1 != 0 {
+            result |= MapPermission::R;
+        }
+        if port & 0b10 != 0 {
+            result |= MapPermission::W;
+        }
+        if port & 0b100 != 0 {
+            result |= MapPermission::X;
+        }
+        result
+    };
+    insert_frames_to_current_task(start_va, end_va, permission);
+    0
 }
 
 // YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
-    -1
+    let end = start + len;
+    let (start_va, end_va) = (VirtAddr::from(start), VirtAddr::from(end));
+
+    if start_va.page_offset() != 0 {
+        return -1;
+    }
+    match delete_area_from_current_task(start_va, end_va) {
+        Some(()) => 0,
+        None => -1,
+    }
 }
 /// change data segment size
 pub fn sys_sbrk(size: i32) -> isize {
