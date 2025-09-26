@@ -48,19 +48,15 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
         sec: us / 1_000_000,
         usec: us % 1_000_000,
     };
-    let src = &data as *const TimeVal as *const u8;
+    let mut src = &data as *const TimeVal as *const u8;
     let struct_size = size_of::<TimeVal>();
     let buffer: Vec<&mut [u8]> =
         translated_byte_buffer(current_user_token(), _ts as *const u8, struct_size);
-    let mut offset = 0;
     for dst in buffer {
-        let len = dst.len().min(struct_size - offset);
-        let dst_ptr: *mut u8 = dst.as_mut_ptr();
-        let src_ptr: *const u8 = unsafe { src.add(offset) };
         unsafe {
-            copy_nonoverlapping(src_ptr, dst_ptr, len);
+            copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
+            src = src.add(dst.len());
         }
-        offset += len;
     }
     0
 }
