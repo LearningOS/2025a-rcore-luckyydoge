@@ -3,13 +3,17 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    loader::get_app_data_by_name,
+    mm::{translated_byte_buffer, translated_refmut, translated_str, MapPermission, VirtAddr},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
     },
+    timer::get_time_us,
 };
+use core::{mem::size_of, ptr::copy_nonoverlapping};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -68,6 +72,11 @@ pub fn sys_exec(path: *const u8) -> isize {
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     //trace!("kernel: sys_waitpid");
+    trace!(
+        "kernel::pid[{}] sys_waitpid [{}]",
+        current_task().unwrap().pid.0,
+        pid
+    );
     let task = current_task().unwrap();
     // find a child process
 
@@ -110,25 +119,116 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
+
+    let us = get_time_us();
+    let data = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let mut src = &data as *const TimeVal as *const u8;
+    let size = size_of::<TimeVal>();
+
+    let buffer = translated_byte_buffer(current_user_token(), _ts as *const u8, size);
+    for buf in buffer {
+        unsafe {
+            copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len());
+            src = src.add(buf.len());
+        }
+    }
     -1
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    if port & 0x7 == 0 || port & !0x7 != 0 || start & (PAGE_SIZE - 1) != 0 {
+        return -1;
+    }
+
+    match (start >> 38) & 1 {
+        0 => {
+            if start >> 39 != 0 {
+                return -1;
+            }
+        }
+        1 => {
+            if (start >> 39).count_zeros() != 0 {
+                return -1;
+            }
+        }
+        _ => {}
+    }
+    let mut permission = MapPermission::U;
+    if port & 0b1 == 1 {
+        permission |= MapPermission::R;
+    }
+    if port & 0b10 == 1 {
+        permission |= MapPermission::W;
+    }
+    if port & 0b100 == 1 {
+        permission |= MapPermission::X;
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let mmset = &mut inner.memory_set;
+    let mut cur = start;
+    while cur < start + len {
+        let vpn = VirtAddr::from(cur).floor();
+        if let Some(pte) = mmset.translate(vpn) {
+            if pte.is_valid() {
+                return -1;
+            }
+        }
+        cur = VirtAddr::from(vpn).0 + PAGE_SIZE;
+    }
+    let (start_va, end_va) = (VirtAddr::from(start), VirtAddr::from(start + len));
+    mmset.insert_framed_area(start_va, end_va, permission);
+    0
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    if start & (PAGE_SIZE - 1) != 0 {
+        return -1;
+    }
+
+    match (start >> 38) & 1 {
+        0 => {
+            if start >> 39 != 0 {
+                return -1;
+            }
+        }
+        1 => {
+            if (start >> 39).count_zeros() != 0 {
+                return -1;
+            }
+        }
+        _ => {}
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let mmset = &mut inner.memory_set;
+    let mut cur = start;
+    while cur < start + len {
+        let vpn = VirtAddr::from(cur).floor();
+        if let Some(pte) = mmset.translate(vpn) {
+            if !pte.is_valid() {
+                return -1;
+            }
+        }
+        cur = VirtAddr::from(vpn).0 + PAGE_SIZE;
+    }
+    let start_va = VirtAddr::from(start);
+    mmset.remove_area_with_start_vpn(start_va.floor());
+    0
 }
 
 /// change data segment size
