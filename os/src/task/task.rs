@@ -1,7 +1,7 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{BIG_STRIDE, TRAP_CONTEXT_BASE};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
@@ -71,6 +71,15 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Task priority
+    pub priority: usize,
+
+    /// Current stride
+    pub stride: usize,
+
+    /// Add to stride after run
+    pub pass: usize,
 }
 
 impl TaskControlBlockInner {
@@ -93,6 +102,10 @@ impl TaskControlBlockInner {
             self.fd_table.push(None);
             self.fd_table.len() - 1
         }
+    }
+
+    pub fn add_pass(&mut self) {
+        self.stride += self.pass;
     }
 }
 
@@ -135,6 +148,9 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: 16,
+                    stride: 0,
+                    pass: BIG_STRIDE / 16,
                 })
             },
         };
@@ -216,6 +232,9 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: 16,
+                    pass: BIG_STRIDE / 16,
+                    stride: 0,
                 })
             },
         });
@@ -229,6 +248,58 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// parent process spawn child process
+    pub fn spawn(self: &Arc<Self>, data: &[u8]) -> Arc<Self> {
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernal_stack_top = kernel_stack.get_top();
+        let control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn: trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernal_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set: memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    priority: 16,
+                    pass: BIG_STRIDE / 16,
+                    stride: 0,
+                    fd_table: vec![
+                        // 0 -> stdin
+                        Some(Arc::new(Stdin)),
+                        // 1 -> stdout
+                        Some(Arc::new(Stdout)),
+                        // 2 -> stderr
+                        Some(Arc::new(Stdout)),
+                    ],
+                })
+            },
+        });
+        let trap_context = control_block.inner_exclusive_access().get_trap_cx();
+        *trap_context = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernal_stack_top,
+            trap_handler as usize,
+        );
+        let mut parent_inner = self.inner_exclusive_access();
+        parent_inner.children.push(control_block.clone());
+        control_block
     }
 
     /// get pid of process
@@ -260,6 +331,18 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// set priority
+    pub fn set_priority(&self, priority: usize) -> () {
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority;
+        inner.pass = BIG_STRIDE / priority;
+    }
+
+    /// add pass
+    pub fn add_pass(&self) {
+        self.inner_exclusive_access().add_pass();
     }
 }
 
