@@ -134,7 +134,7 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
             src = src.add(buf.len());
         }
     }
-    -1
+    0
 }
 
 /// YOUR JOB: Implement mmap.
@@ -195,9 +195,6 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    if start & (PAGE_SIZE - 1) != 0 {
-        return -1;
-    }
 
     match (start >> 38) & 1 {
         0 => {
@@ -222,10 +219,15 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
             if !pte.is_valid() {
                 return -1;
             }
+        } else {
+            return -1;
         }
         cur = VirtAddr::from(vpn).0 + PAGE_SIZE;
     }
     let start_va = VirtAddr::from(start);
+    if start_va.page_offset() != 0 {
+        return -1;
+    }
     mmset.remove_area_with_start_vpn(start_va.floor());
     0
 }
@@ -242,12 +244,22 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
+pub fn sys_spawn(path: *const u8) -> isize {
     trace!(
         "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let cur_task = current_task().unwrap();
+        let new_task = cur_task.spawn(data);
+        let pid = new_task.pid.0;
+        add_task(new_task);
+        pid as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
