@@ -183,4 +183,57 @@ impl Inode {
         });
         block_cache_sync_all();
     }
+
+    /// Hard link at name to inode id.
+    pub fn link_at(&self, old_name: &str, new_name: &str) -> () {
+        let mut fs = self.fs.lock();
+        let inode_id = self.read_disk_inode(|root_inode| {
+            assert!(root_inode.is_dir());
+            self.find_inode_id(old_name, root_inode).unwrap()
+        });
+
+        self.modify_disk_inode(|root_inode| {
+            // append file in the dirent
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            // increase size
+            self.increase_size(new_size as u32, root_inode, &mut fs);
+            // write dirent
+            let dirent = DirEntry::new(new_name, inode_id);
+            root_inode.write_at(
+                file_count * DIRENT_SZ,
+                dirent.as_bytes(),
+                &self.block_device,
+            );
+        });
+    }
+    /// get inode's link count, only root inode can use.
+    pub fn get_link_cnt_by_inode_id(&self, inode_id: u32) -> u32 {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|root_inode| {
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let mut result: u32 = 0;
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                root_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device);
+                if dirent.inode_id() == inode_id {
+                    result += 1;
+                }
+            }
+            result
+        })
+    }
+    /// get inode id
+    pub fn get_inode_id(&self) -> u32 {
+        let fs = self.fs.lock();
+        fs.get_inode_id(self.block_id as u32, self.block_offset as u32)
+    }
+    /// Whether the inode is file or not
+    pub fn is_file(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_file())
+    }
+    /// Whether the inode is directory or not
+    pub fn is_dir(&self) -> bool {
+        self.read_disk_inode(|disk_inode| disk_inode.is_dir())
+    }
 }
