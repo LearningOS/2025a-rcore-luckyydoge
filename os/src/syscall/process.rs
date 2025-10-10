@@ -181,7 +181,7 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
             src = src.add(buf.len());
         }
     }
-    -1
+    0
 }
 
 /// mmap syscall

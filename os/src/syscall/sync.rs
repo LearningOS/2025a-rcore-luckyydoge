@@ -2,6 +2,7 @@ use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 /// sleep syscall
 pub fn sys_sleep(ms: usize) -> isize {
     trace!(
@@ -49,9 +50,11 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
         .map(|(id, _)| id)
     {
         process_inner.mutex_list[id] = mutex;
+        process_inner.mutex_available[id] = 1;
         id as isize
     } else {
         process_inner.mutex_list.push(mutex);
+        process_inner.mutex_available.push(1);
         process_inner.mutex_list.len() as isize - 1
     }
 }
@@ -69,8 +72,14 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
             .tid
     );
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
+    if process_inner.enable_dead_detect {
+        if process_inner.mutex_available[mutex_id] == 0 {
+            return -0xDEAD;
+        }
+        process_inner.mutex_available[mutex_id] -= 1;
+    }
     drop(process_inner);
     drop(process);
     mutex.lock();
@@ -90,8 +99,11 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
             .tid
     );
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
+    if process_inner.enable_dead_detect {
+        process_inner.mutex_available[mutex_id] += 1;
+    }
     drop(process_inner);
     drop(process);
     mutex.unlock();
@@ -120,11 +132,13 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
         .map(|(id, _)| id)
     {
         process_inner.semaphore_list[id] = Some(Arc::new(Semaphore::new(res_count)));
+        process_inner.semaphore_available[id] = res_count as i32;
         id
     } else {
         process_inner
             .semaphore_list
             .push(Some(Arc::new(Semaphore::new(res_count))));
+        process_inner.semaphore_available.push(res_count as i32);
         process_inner.semaphore_list.len() - 1
     };
     id as isize
@@ -143,7 +157,22 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
             .tid
     );
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
+    if process_inner.enable_dead_detect {
+        process_inner.semaphore_available[sem_id] += 1;
+        let tid = current_task()
+            .unwrap()
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .unwrap()
+            .tid;
+        let res_count = process_inner.semaphore_available.len();
+        if let Some(allocation) = &mut process_inner.semaphore_allocation[tid] {
+            allocation.resize(res_count, 0);
+            allocation[sem_id] -= 1;
+        }
+    }
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
     sem.up();
@@ -163,10 +192,82 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
             .tid
     );
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
+    let tid = current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid;
+    if process_inner.enable_dead_detect {
+        let res_count = process_inner.semaphore_available.len();
+        {
+            let needed: &mut Vec<Option<Vec<i32>>> = &mut process_inner.semaphore_needed;
+            if needed.len() < tid + 1 {
+                needed.resize(
+                    tid + 1,
+                    Some((0..res_count).map(|_| 0).collect::<Vec<i32>>()),
+                );
+            }
+            if let Some(task_needed) = &mut needed[tid] {
+                task_needed.resize(res_count, 0);
+                task_needed[sem_id] += 1;
+            }
+        }
+        {
+            let alloc: &mut Vec<Option<Vec<i32>>> = &mut process_inner.semaphore_allocation;
+            if alloc.len() < tid + 1 {
+                alloc.resize(tid + 1, Some((0..res_count).map(|_| 0).collect()));
+            }
+        }
+        let needed = &process_inner.semaphore_needed;
+        let allocation = &process_inner.semaphore_allocation;
+        let mut work = process_inner.semaphore_available.clone();
+        let mut finish: Vec<bool> = (0..needed.len()).map(|_| false).collect();
+        let mut unsafe_tasks = needed.iter().filter(|n| n.is_some()).count();
+        let mut i = 0;
+        println!("tid: {} needed: {:?}", tid, needed);
+        println!("tid: {} alloc: {:?}", tid, allocation);
+        while i < needed.len() && unsafe_tasks > 0 {
+            if let (Some(task_needed), Some(task_alloc)) = (&needed[i], &allocation[i]) {
+                if !finish[i] {
+                    if task_needed.iter().zip(work.iter()).all(|(n, w)| n <= w) {
+                        finish[i] = true;
+                        unsafe_tasks -= 1;
+                        println!("tid: {} work: {:?}", tid, work);
+
+                        work.iter_mut()
+                            .zip(task_alloc.iter())
+                            .for_each(|(w, n)| *w += *n);
+                        i = 0;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        if unsafe_tasks != 0 {
+            return -0xDEAD;
+        }
+    }
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
     sem.down();
+    let mut process_inner = process.inner_exclusive_access();
+    if process_inner.enable_dead_detect {
+        process_inner.semaphore_available[sem_id] -= 1;
+        //        let res_count = process_inner.semaphore_available.len();
+        let task = current_task().unwrap();
+        let task_inner = task.inner_exclusive_access();
+        let tid = task_inner.res.as_ref().unwrap().tid;
+        if let Some(needed) = &mut process_inner.semaphore_needed[tid] {
+            needed[sem_id] -= 1;
+        }
+        if let Some(alloc) = &mut process_inner.semaphore_allocation[tid] {
+            alloc[sem_id] += 1;
+        }
+    }
     0
 }
 /// condvar create syscall
@@ -247,5 +348,12 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
 /// YOUR JOB: Implement deadlock detection, but might not all in this syscall
 pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
     trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
-    -1
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    match _enabled {
+        0 => process_inner.enable_dead_detect = false,
+        1 => process_inner.enable_dead_detect = true,
+        _ => return -1,
+    }
+    0
 }
