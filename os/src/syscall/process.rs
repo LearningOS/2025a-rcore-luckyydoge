@@ -161,13 +161,13 @@ pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
         _ => {}
     }
     let mut permission = MapPermission::U;
-    if port & 0b1 == 1 {
+    if port & 0b1 != 0 {
         permission |= MapPermission::R;
     }
-    if port & 0b10 == 1 {
+    if port & 0b10 != 0 {
         permission |= MapPermission::W;
     }
-    if port & 0b100 == 1 {
+    if port & 0b100 != 0 {
         permission |= MapPermission::X;
     }
 
